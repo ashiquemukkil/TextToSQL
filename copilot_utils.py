@@ -7,7 +7,6 @@ from pathlib import Path
 import json
 import os 
 import base64
-import traceback
 from openai import OpenAI
 from sqlalchemy import create_engine  
 from plotly.graph_objects import Figure as PlotlyFigure
@@ -22,25 +21,24 @@ from tenacity import retry, wait_random_exponential, stop_after_attempt
 import pandas as pd
 from dotenv import load_dotenv
 import inspect
+from prompt import get_system_prompt,CODER1,CODER2,CODER_FUNCTIONS_SPEC1,CODER_FUNCTIONS_SPEC2
+from config import (
+    SQLITE_DB_PATH,OPENAI_EMB_DEPLOYMENT,OPENAI_GPT35_DEPLOYMENT,
+    OPENAI_GPT4_DEPLOYMENT,MAX_ERROR_RUN,MAX_RUN_PER_QUESTION,
+    MAX_QUESTION_TO_KEEP,MAX_QUESTION_WITH_DETAIL_HIST,OPENAI_API_KEY
+)
+
+
 env_path = Path('.') / 'secrets.env'
 load_dotenv(dotenv_path=env_path)
-MAX_ERROR_RUN = 3
-MAX_RUN_PER_QUESTION =10
-MAX_QUESTION_TO_KEEP = 3
-MAX_QUESTION_WITH_DETAIL_HIST = 1
-
-emb_engine = os.getenv("OPENAI_EMB_DEPLOYMENT","text-embedding-ada-002")
-chat_engine1 =os.getenv("OPENAI_GPT4_DEPLOYMENT","gpt-4o")
-chat_engine2 =os.getenv("OPENAI_GPT35_DEPLOYMENT","gpt-4o")
-sqllite_db_path= os.environ.get("SQLITE_DB_PATH","data/northwind.db")
-engine = create_engine(f'sqlite:///{sqllite_db_path}') 
+engine = create_engine(f'sqlite:///{SQLITE_DB_PATH}') 
 
 client = OpenAI(
-    api_key = os.environ.get("OPENAI_API_KEY",""),
+    api_key = OPENAI_API_KEY,
 )
 max_conversation_len = 5  # Set the desired value of k
 
-def get_embedding(text, model=emb_engine):
+def get_embedding(text, model=OPENAI_EMB_DEPLOYMENT):
    text = text.replace("\n", " ")
    return client.embeddings.create(input = [text], model=model).data[0].embedding
 
@@ -76,17 +74,16 @@ def comment_on_graph(question, image_path="plot.jpg"):
 
     return response.choices[0].message.content
 
+# SQL query executor
 def execute_sql_query(sql_query, limit=100):  
     result = pd.read_sql_query(sql_query, engine)
     result = result.infer_objects()
     for col in result.columns:  
         if 'date' in col.lower():  
             result[col] = pd.to_datetime(result[col], errors="ignore")  
-
-    # result = result.head(limit)  # limit to save memory  
-    # st.write(result)
     return result
 
+#context retrieval with help of metadata.json
 @retry(wait=wait_random_exponential(min=1, max=20), stop=stop_after_attempt(6))
 def retrieve_context(business_concepts):
     # Load the metadata file
@@ -103,24 +100,10 @@ def retrieve_context(business_concepts):
     #add headers 'Scenario' and 'Description' to scenario_list_md
     scenario_list_md = f"| Scenario | Description |\n| --- | --- |\n{scenario_list_md}"
 
-    sys_msg = f"""
-    You are an AI assistant that helps people find information. 
-    You are given business concept(s) and you need to identify which one or several business analytic scenario(s) below are relevant to the them.
-    <<analytic_scenarios>>
-    {scenario_list_md}
-    <</analytic_scenarios>>
-    Output your response in json format with the following structure:   
-    {{
-        "scenarios": [
-            {{
-                "scenario_name": "...", # name of the scenario. 
-            }}
-        ]
-    }}
-    """
+    sys_msg = get_system_prompt(scenario_list_md)
 
     response = client.chat.completions.create(
-        model=chat_engine1, # The deployment name you chose when you deployed the GPT-35-turbo or GPT-4 model.
+        model=OPENAI_GPT4_DEPLOYMENT, # The deployment name you chose when you deployed the GPT-35-turbo or GPT-4 model.
         messages=[{"role": "system", "content": sys_msg}, {"role": "user", "content": business_concepts}],
     response_format={"type": "json_object"}
     
@@ -164,53 +147,6 @@ def retrieve_context(business_concepts):
         scenario_context += f"- {scenario_name}: {str(analytic_scenarios[scenario_name]['rules'])}\n"
     return scenario_context
 
-today = pd.Timestamp.today()
-#format today's date
-today = today.strftime("%Y-%m-%d")
-CODER1 = f"""
-You are a highly skilled data analyst proficient in data analysis, visualization, SQL, and Python, tasked with responding to inquiries from business users. 
-Today's date is {today}. The data is housed in a SQLITE database. All data queries, transformations, and visualizations must be conducted through a designated Python interface.
-Your initial step is to engage with the user to grasp their requirements, asking clarifying questions as necessary. Next, you will review the relevant business rules and table schemas that pertain to the user's query to adeptly craft your code for answering their questions.
-If the query is intricate, employ best practices in business analytics to decompose it into manageable steps, articulating your analytical process to the user throughout. Conclude by presenting your findings in a clear, succinct manner, employing visualizations when beneficial to optimally convey your insights.
-
-"""
-CODER2= """
-You are a highly skilled data analyst proficient in data analysis, visualization, SQL, and Python, tasked with addressing inquiries from business users. Today's date is {today}. 
-The data is stored in an SQLITE database, and all data querying, transformation, and visualization must be conducted through a Python interface provided to you.
-Begin by engaging with the user to fully understand their requirements, asking clarifying questions as needed. You are provided with similiar answered questions with solutions.
-First, assess whether these reference solutions offer sufficient context to address the new user question. If they do, proceed to implement the solution directly. 
-If they do not provide enough information, utilize the 'retrieve additional context' function to gather more details necessary to formulate an accurate response.
-When presenting your findings, use visualizations strategically to effectively communicate your answers.
-
-"""
-
-
-def create_or_update_action_plan(new_or_updated_plan):
-    return new_or_updated_plan
-def update_notebook(existing_content, new_content):  
-    """  
-    Update the existing notebook content with new content.  
-  
-    :param existing_content: The existing content of the notebook.  
-    :param new_content: The new content to add to the notebook.  
-    :return: The updated notebook content.  
-    """  
-    # Identify the start of the notebook section  
-    notebook_start = existing_content.find('## Notebook:')  
-      
-    # Check if the notebook section is found  
-    if notebook_start == -1:  
-        # The notebook section doesn't exist, return the original content  
-        return existing_content  
-      
-    # Extract the content before and after the notebook section  
-    before_notebook = existing_content[:notebook_start]  
-      
-    updated_content = before_notebook.strip() +"\n## Action plan:\n"+ new_content.strip()    
-      
-    return updated_content  
-
-
 
 def execute_python_code(assumptions, goal,python_code,execution_context):
 
@@ -220,9 +156,6 @@ def execute_python_code(assumptions, goal,python_code,execution_context):
         for col in result.columns:  
             if 'date' in col.lower():  
                 result[col] = pd.to_datetime(result[col], errors="ignore")  
-
-        # result = result.head(limit)  # limit to save memory  
-        # st.write(result)
         return result
   
     def reduce_dataframe_size(df):  
@@ -365,90 +298,13 @@ def execute_python_code(assumptions, goal,python_code,execution_context):
         return execution_context, "The graph for the data is displayed to the user."
     
 
-
-
-def resolve_entities(business_question):
-    if 'VINET' in business_question:
-        return business_question.replace("VINET", "VINET customer")
-    return "Cannot resolve the entities in the question. Please clarify with the customer."
 def get_additional_context():
     pass
 
 CODER_AVAILABLE_FUNCTIONS1 = {
-            "execute_python_code": execute_python_code,
-            "retrieve_context": retrieve_context,
-        } 
-
-
-CODER_FUNCTIONS_SPEC1= [  
-    
-    {
-        "type":"function",
-        "function":{
-
-        "name": "execute_python_code",
-        "description": "A special python interface that can run data analytical python code against the SQL database and data visualization with plotly. Do not use from pandas.io.json import json_normalize use from pandas import json_normalize instead",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "assumptions": {
-                    "type": "string",
-                    "description": "List of assumptions you made in your code."
-                },
-                "goal": {
-                    "type": "string",
-                    "description": "description of what you hope to achieve with this python code snippset. The description should be in the same language as the question asked by the user."
-                },
-
-                "python_code": {
-                    "type": "string",
-                    "description": "Complete executable python code. You are provided with following utility python functions to use INSIDE your code \n 1. execute_sql_query(sql_query: str) a function to execute SQL query against the SQLITE database to retrieve data you need. This execute_sql_query(sql_query: str) function returns a pandas dataframe that you can use to perform any data analysis and visualization. Be efficient, avoid using Select *, instead select specific column names if possible\n 2. show_to_user(data): a util function to display the data analysis and visualization result from this environment to user. This function can take a pandas dataframe or plotly figure as input. For example, to visualize a plotly figure, the code can be ```fig=px.line(some_df)\n show_to_user(fig)```. Only use plotly for graph visualization. Remember, only use show_to_user if you want to display the data to the user. If you want to observe any data for yourself, use print() function instead "
-                },
-
-
-            },
-            "required": ["assumptions", "goal","python_code" ],
-        },
-
-    }
-    },
-    {
-        "type":"function",
-        "function":{
-
-        "name": "retrieve_context",
-        "description": "retrieve business rules and table schemas that are relevant to the customer's question",
-
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "business_concepts": {
-                    "type": "string",
-                    "description": "One or multiple business concepts that the user is asking about. For example, 'total sales', 'top customers', 'most popular products'." 
-                }
-
-
-            },
-            "required": ["business_concepts"],
-        },
-    }
-    },
-
-
-]  
-
-CODER_FUNCTIONS_SPEC2= [{
-        "type":"function",
-        "function":{
-
-        "name": "get_additional_context",
-        "description": "Current context information is not sufficient, get additional context to be able to write code to answer the question",
-        },
-
-    }]
-CODER_FUNCTIONS_SPEC2.append(CODER_FUNCTIONS_SPEC1[0]) #append execute_python_code to CODER_FUNCTIONS_SPEC2
-#
-
+    "execute_python_code": execute_python_code,
+    "retrieve_context": retrieve_context,
+} 
 CODER_AVAILABLE_FUNCTIONS2={}
 CODER_AVAILABLE_FUNCTIONS2["execute_python_code"] = execute_python_code
 CODER_AVAILABLE_FUNCTIONS2["get_additional_context"] = get_additional_context
@@ -466,6 +322,7 @@ def check_args(function, args):
     for name, param in params.items():
         if param.default is param.empty and name not in args:
             return False
+        
 def clean_up_history(history, max_q_with_detail_hist=1, max_q_to_keep=2):
     # start from end of history, count the messages with role user, if the count is more than max_q_with_detail_hist, remove messages from there with roles tool.
     # if the count is more than max_q_hist_to_keep, remove all messages from there until message number 1
@@ -502,7 +359,7 @@ class Smart_Agent():
     """
     """
 
-    def __init__(self, persona,functions_spec, functions_list, name=None, init_message=None, engine =chat_engine2):
+    def __init__(self, persona,functions_spec, functions_list, name=None, init_message=None, engine =OPENAI_GPT35_DEPLOYMENT):
         if init_message is not None:
             init_hist =[{"role":"system", "content":persona}, {"role":"assistant", "content":init_message}]
         else:
@@ -522,11 +379,11 @@ class Smart_Agent():
                 if similiar_question is not None:
                     new_system_message = {"role": "system", "content": CODER2+"here are similiar answered questions with solutions: \n"+similiar_question}
                     self.conversation[0]= new_system_message
-                    self.engine = chat_engine2
+                    self.engine = OPENAI_GPT35_DEPLOYMENT
                     self.persona = "coder2"
                     self.functions_spec = CODER_FUNCTIONS_SPEC2
                     self.functions_list = CODER_AVAILABLE_FUNCTIONS2
-                    if self.engine == chat_engine2:
+                    if self.engine == OPENAI_GPT35_DEPLOYMENT:
                         print("Giving similiar solutions context to coder2")
                     else:
                         print("Switching persona to coder2 from coder1")
@@ -534,7 +391,7 @@ class Smart_Agent():
                 print("Switching persona to coder1")
                 new_system_message = {"role": "system", "content": CODER1}
                 self.conversation[0]= new_system_message
-                self.engine = chat_engine1
+                self.engine = OPENAI_GPT4_DEPLOYMENT
                 self.persona = "coder1"
                 self.functions_spec = CODER_FUNCTIONS_SPEC1
                 self.functions_list = CODER_AVAILABLE_FUNCTIONS1
@@ -548,7 +405,7 @@ class Smart_Agent():
             self.conversation = conversation
         # similiar_question = get_cache(user_input)
         similiar_question = []
-        if self.engine == chat_engine1:
+        if self.engine == OPENAI_GPT4_DEPLOYMENT:
             if len(similiar_question)>0:
                 self.switch_persona(similiar_question)
         else:
@@ -681,15 +538,3 @@ class Smart_Agent():
             assistant_response = response_message
 
         return stream,code, self.conversation, assistant_response, data
-    
-
-import re
-
-def extract_sql_query(text):
-    # Regular expression to capture content between triple quotes (''' or """)
-    match = re.search(r"(?:''')(.*?)(?:''')", text, re.DOTALL)
-    if match:
-        query = match.group(1).strip()
-        return query
-    else:
-        return None

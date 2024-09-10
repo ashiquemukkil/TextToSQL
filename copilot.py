@@ -3,7 +3,7 @@ from streamlit_extras.add_vertical_space import add_vertical_space
 from plotly.graph_objects import Figure as PlotlyFigure
 from matplotlib.figure import Figure as MatplotFigure
 import pandas as pd
-from copilot_utils import CODER2, CODER_AVAILABLE_FUNCTIONS2, CODER_FUNCTIONS_SPEC2, Smart_Agent,extract_sql_query
+from copilot_utils import CODER2, CODER_AVAILABLE_FUNCTIONS2, CODER_FUNCTIONS_SPEC2, Smart_Agent
 
 
 # Initialize smart agent with CODER1 persona
